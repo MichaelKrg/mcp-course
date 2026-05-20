@@ -32,6 +32,23 @@ def get_price(symbol: str) -> Any:
     response.raise_for_status()
     return response.json()
 
+@mcp.tool()
+def get_price_dayStats(symbol: str) -> Any:
+    """
+    Get the price statistics of today for a crypto asset from Binance
+
+    Args:
+        symbol (str): The symbol of the crypto asset to get the price statistics of
+
+    Returns:
+        Any: The price statistics of the crypto asset
+    """
+    symbol = get_symbol_from_name(symbol)
+    url = f"https://api.binance.com/api/v3/ticker/tradingDay?type=MINI&symbol={symbol}"
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
+
 
 @mcp.tool()
 def get_price_price_change(symbol: str) -> Any:
