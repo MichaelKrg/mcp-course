@@ -1,9 +1,11 @@
 {
-  "name": "zoltanctoth-course-binancemcp",
+  "name": "mkraegel-course-binancemcp",
   "version": "1.0.0",
   "description": "MCP server that provides Binance price data",
   "main": "dist/binance_mcp.js",
-  "bin": "dist/binance_mcp.js",
+  "bin": {
+    "mkraegel-course-binancemcp": "dist/binance_mcp.js"
+  },
   "scripts": {
     "build": "tsc",
     "prepare": "npm run build"
