@@ -1,58 +1,123 @@
+import { env } from "cloudflare:workers";
 import type { AuthRequest, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { Hono } from "hono";
 import { Octokit } from "octokit";
-import { fetchUpstreamAuthToken, getUpstreamAuthorizeUrl, Props } from "./utils";
-import { env } from "cloudflare:workers";
-import { clientIdAlreadyApproved, parseRedirectApproval, renderApprovalDialog } from "./workers-oauth-utils";
+import { fetchUpstreamAuthToken, getUpstreamAuthorizeUrl, type Props } from "./utils";
+import {
+	addApprovedClient,
+	bindStateToSession,
+	createOAuthState,
+	generateCSRFProtection,
+	isClientApproved,
+	OAuthError,
+	renderApprovalDialog,
+	validateCSRFToken,
+	validateOAuthState,
+} from "./workers-oauth-utils";
 
 const app = new Hono<{ Bindings: Env & { OAUTH_PROVIDER: OAuthHelpers } }>();
 
 app.get("/authorize", async (c) => {
-  const oauthReqInfo = await c.env.OAUTH_PROVIDER.parseAuthRequest(c.req.raw);
-  const { clientId } = oauthReqInfo;
-  if (!clientId) {
-    return c.text("Invalid request", 400);
-  }
+	const oauthReqInfo = await c.env.OAUTH_PROVIDER.parseAuthRequest(c.req.raw);
+	const { clientId } = oauthReqInfo;
+	if (!clientId) {
+		return c.text("Invalid request", 400);
+	}
 
-  if (await clientIdAlreadyApproved(c.req.raw, oauthReqInfo.clientId, env.COOKIE_ENCRYPTION_KEY)) {
-    return redirectToGithub(c.req.raw, oauthReqInfo);
-  }
+	// Check if client is already approved
+	if (await isClientApproved(c.req.raw, clientId, env.COOKIE_ENCRYPTION_KEY)) {
+		// Skip approval dialog but still create secure state and bind to session
+		const { stateToken } = await createOAuthState(oauthReqInfo, c.env.OAUTH_KV);
+		const { setCookie: sessionBindingCookie } = await bindStateToSession(stateToken);
+		return redirectToGithub(c.req.raw, stateToken, { "Set-Cookie": sessionBindingCookie });
+	}
 
-  return renderApprovalDialog(c.req.raw, {
-    client: await c.env.OAUTH_PROVIDER.lookupClient(clientId),
-    server: {
-      name: "Cloudflare GitHub MCP Server",
-      logo: "https://avatars.githubusercontent.com/u/314135?s=200&v=4",
-      description: "This is a demo MCP Remote Server using GitHub for authentication.", // optional
-    },
-    state: { oauthReqInfo }, // arbitrary data that flows through the form submission below
-  });
+	// Generate CSRF protection for the approval form
+	const { token: csrfToken, setCookie } = generateCSRFProtection();
+
+	return renderApprovalDialog(c.req.raw, {
+		client: await c.env.OAUTH_PROVIDER.lookupClient(clientId),
+		csrfToken,
+		server: {
+			description: "This is a demo MCP Remote Server using GitHub for authentication.",
+			logo: "https://avatars.githubusercontent.com/u/314135?s=200&v=4",
+			name: "Cloudflare GitHub MCP Server",
+		},
+		setCookie,
+		state: { oauthReqInfo },
+	});
 });
 
 app.post("/authorize", async (c) => {
-  // Validates form submission, extracts state, and generates Set-Cookie headers to skip approval dialog next time
-  const { state, headers } = await parseRedirectApproval(c.req.raw, env.COOKIE_ENCRYPTION_KEY);
-  if (!state.oauthReqInfo) {
-    return c.text("Invalid request", 400);
-  }
+	try {
+		// Read form data once
+		const formData = await c.req.raw.formData();
 
-  return redirectToGithub(c.req.raw, state.oauthReqInfo, headers);
+		// Validate CSRF token
+		validateCSRFToken(formData, c.req.raw);
+
+		// Extract state from form data
+		const encodedState = formData.get("state");
+		if (!encodedState || typeof encodedState !== "string") {
+			return c.text("Missing state in form data", 400);
+		}
+
+		let state: { oauthReqInfo?: AuthRequest };
+		try {
+			state = JSON.parse(atob(encodedState));
+		} catch (_e) {
+			return c.text("Invalid state data", 400);
+		}
+
+		if (!state.oauthReqInfo || !state.oauthReqInfo.clientId) {
+			return c.text("Invalid request", 400);
+		}
+
+		// Add client to approved list
+		const approvedClientCookie = await addApprovedClient(
+			c.req.raw,
+			state.oauthReqInfo.clientId,
+			c.env.COOKIE_ENCRYPTION_KEY,
+		);
+
+		// Create OAuth state and bind it to this user's session
+		const { stateToken } = await createOAuthState(state.oauthReqInfo, c.env.OAUTH_KV);
+		const { setCookie: sessionBindingCookie } = await bindStateToSession(stateToken);
+
+		// Set both cookies: approved client list + session binding
+		const headers = new Headers();
+		headers.append("Set-Cookie", approvedClientCookie);
+		headers.append("Set-Cookie", sessionBindingCookie);
+
+		return redirectToGithub(c.req.raw, stateToken, Object.fromEntries(headers));
+	} catch (error: any) {
+		console.error("POST /authorize error:", error);
+		if (error instanceof OAuthError) {
+			return error.toResponse();
+		}
+		// Unexpected non-OAuth error
+		return c.text(`Internal server error: ${error.message}`, 500);
+	}
 });
 
-async function redirectToGithub(request: Request, oauthReqInfo: AuthRequest, headers: Record<string, string> = {}) {
-  return new Response(null, {
-    status: 302,
-    headers: {
-      ...headers,
-      location: getUpstreamAuthorizeUrl({
-        upstream_url: "https://github.com/login/oauth/authorize",
-        scope: "read:user",
-        client_id: env.GITHUB_CLIENT_ID,
-        redirect_uri: new URL("/callback", request.url).href,
-        state: btoa(JSON.stringify(oauthReqInfo)),
-      }),
-    },
-  });
+async function redirectToGithub(
+	request: Request,
+	stateToken: string,
+	headers: Record<string, string> = {},
+) {
+	return new Response(null, {
+		headers: {
+			...headers,
+			location: getUpstreamAuthorizeUrl({
+				client_id: env.GITHUB_CLIENT_ID,
+				redirect_uri: new URL("/callback", request.url).href,
+				scope: "read:user",
+				state: stateToken,
+				upstream_url: "https://github.com/login/oauth/authorize",
+			}),
+		},
+		status: 302,
+	});
 }
 
 /**
@@ -62,46 +127,78 @@ async function redirectToGithub(request: Request, oauthReqInfo: AuthRequest, hea
  * It exchanges the temporary code for an access token, then stores some
  * user metadata & the auth token as part of the 'props' on the token passed
  * down to the client. It ends by redirecting the client back to _its_ callback URL
+ *
+ * SECURITY: This endpoint validates that the state parameter from GitHub
+ * matches both:
+ * 1. A valid state token in KV (proves it was created by our server)
+ * 2. The __Host-CONSENTED_STATE cookie (proves THIS browser consented to it)
+ *
+ * This prevents CSRF attacks where an attacker's state token is injected
+ * into a victim's OAuth flow.
  */
 app.get("/callback", async (c) => {
-  // Get the oathReqInfo out of KV
-  const oauthReqInfo = JSON.parse(atob(c.req.query("state") as string)) as AuthRequest;
-  if (!oauthReqInfo.clientId) {
-    return c.text("Invalid state", 400);
-  }
+	// Validate OAuth state with session binding
+	// This checks both KV storage AND the session cookie
+	let oauthReqInfo: AuthRequest;
+	let clearSessionCookie: string;
 
-  // Exchange the code for an access token
-  const [accessToken, errResponse] = await fetchUpstreamAuthToken({
-    upstream_url: "https://github.com/login/oauth/access_token",
-    client_id: c.env.GITHUB_CLIENT_ID,
-    client_secret: c.env.GITHUB_CLIENT_SECRET,
-    code: c.req.query("code"),
-    redirect_uri: new URL("/callback", c.req.url).href,
-  });
-  if (errResponse) return errResponse;
+	try {
+		const result = await validateOAuthState(c.req.raw, c.env.OAUTH_KV);
+		oauthReqInfo = result.oauthReqInfo;
+		clearSessionCookie = result.clearCookie;
+	} catch (error: any) {
+		if (error instanceof OAuthError) {
+			return error.toResponse();
+		}
+		// Unexpected non-OAuth error
+		return c.text("Internal server error", 500);
+	}
 
-  // Fetch the user info from GitHub
-  const user = await new Octokit({ auth: accessToken }).rest.users.getAuthenticated();
-  const { login, name, email } = user.data;
+	if (!oauthReqInfo.clientId) {
+		return c.text("Invalid OAuth request data", 400);
+	}
 
-  // Return back to the MCP client a new token
-  const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
-    request: oauthReqInfo,
-    userId: login,
-    metadata: {
-      label: name,
-    },
-    scope: oauthReqInfo.scope,
-    // This will be available on this.props inside MyMCP
-    props: {
-      login,
-      name,
-      email,
-      accessToken,
-    } as Props,
-  });
+	// Exchange the code for an access token
+	const [accessToken, errResponse] = await fetchUpstreamAuthToken({
+		client_id: c.env.GITHUB_CLIENT_ID,
+		client_secret: c.env.GITHUB_CLIENT_SECRET,
+		code: c.req.query("code"),
+		redirect_uri: new URL("/callback", c.req.url).href,
+		upstream_url: "https://github.com/login/oauth/access_token",
+	});
+	if (errResponse) return errResponse;
 
-  return Response.redirect(redirectTo);
+	// Fetch the user info from GitHub
+	const user = await new Octokit({ auth: accessToken }).rest.users.getAuthenticated();
+	const { login, name, email } = user.data;
+
+	// Return back to the MCP client a new token
+	const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
+		metadata: {
+			label: name,
+		},
+		// This will be available on this.props inside MyMCP
+		props: {
+			accessToken,
+			email,
+			login,
+			name,
+		} as Props,
+		request: oauthReqInfo,
+		scope: oauthReqInfo.scope,
+		userId: login,
+	});
+
+	// Clear the session binding cookie (one-time use) by creating response with headers
+	const headers = new Headers({ Location: redirectTo });
+	if (clearSessionCookie) {
+		headers.set("Set-Cookie", clearSessionCookie);
+	}
+
+	return new Response(null, {
+		status: 302,
+		headers,
+	});
 });
 
 export { app as GitHubHandler };
