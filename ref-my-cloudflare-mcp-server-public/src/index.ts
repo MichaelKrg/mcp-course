@@ -1,5 +1,5 @@
-import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpAgent } from "agents/mcp";
 import { z } from "zod";
 
 function getSymbolFromName(name: string): string {
@@ -19,24 +19,25 @@ export class MyMCP extends McpAgent {
 
 	async init() {
 		// Simple addition tool
-		this.server.tool(
+		this.server.registerTool(
 			"add",
-			{ a: z.number(), b: z.number() },
+			{ inputSchema: { a: z.number(), b: z.number() } },
 			async ({ a, b }) => ({
 				content: [{ type: "text", text: String(a + b) }],
-			})
+			}),
 		);
-		
-		this.server.tool(
+
+		this.server.registerTool(
 			// Tool name
 			"get_price",
 			// Parameter schema using zod (similar to Python's type hints but with runtime validation)
-			{ symbol: z.string() },
+			{ inputSchema: { symbol: z.string() } },
 			// Async handler function (similar to Python's async def)
 			// Arrow function syntax is common in TypeScript: ({params}) => { body }
 			async ({ symbol }) => {
 				const resolvedSymbol = getSymbolFromName(symbol);
-				const url = `https://mcp-course.s3.eu-central-1.amazonaws.com/public/hard-coded-price.json`;
+				const url = `https://api.binance.com/api/v3/ticker/price?symbol=${resolvedSymbol}`;
+                                // const url = `https://mcp-course.s3.eu-central-1.amazonaws.com/public/hard-coded-price.json`;
 				// fetch is built into modern Node.js (similar to Python's requests.get)
 				const response = await fetch(url);
 				if (!response.ok) {
@@ -54,21 +55,13 @@ export class MyMCP extends McpAgent {
 			}
 		);
 	}
-
-	
 }
 
 export default {
 	fetch(request: Request, env: Env, ctx: ExecutionContext) {
 		const url = new URL(request.url);
 
-		if (url.pathname === "/sse" || url.pathname === "/sse/message") {
-			// @ts-ignore
-			return MyMCP.serveSSE("/sse").fetch(request, env, ctx);
-		}
-
 		if (url.pathname === "/mcp") {
-			// @ts-ignore
 			return MyMCP.serve("/mcp").fetch(request, env, ctx);
 		}
 
